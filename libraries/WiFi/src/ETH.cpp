@@ -288,12 +288,7 @@ bool ETHClass::begin(uint8_t phy_addr, int power, int mdc, int mdio, eth_phy_typ
             break;
 #endif
         case ETH_PHY_KSZ8081:
-#if ESP_IDF_VERSION > ESP_IDF_VERSION_VAL(4,3,0)
-            eth_phy = esp_eth_phy_new_ksz8081(&phy_config);
-#else
-            log_e("unsupported ethernet type 'ETH_PHY_KSZ8081'");
-#endif
-            break;
+            eth_phy = esp_eth_phy_new_ksz8041(&phy_config);
         default:
             break;
     }
@@ -461,7 +456,7 @@ IPAddress ETHClass::gatewayIP()
 
 IPAddress ETHClass::dnsIP(uint8_t dns_no)
 {
-    const ip_addr_t * dns_ip = dns_getserver(dns_no);
+    const ip_addr_t* dns_ip = dns_getserver(dns_no);
     return IPAddress(dns_ip->u_addr.ip4.addr);
 }
 

@@ -20,7 +20,6 @@
   Modified December 2014 by Ivan Grokhotkov (ivan@esp8266.com) - esp8266 support
   Modified April 2015 by Hrsto Gochkov (ficeto@ficeto.com) - alternative esp8266 support
   Modified Nov 2017 by Chuck Todd (ctodd@cableone.net) - ESP32 ISR Support
-  Modified Nov 2021 by Hristo Gochkov <Me-No-Dev> to support ESP-IDF API
  */
 
 extern "C" {
@@ -37,79 +36,30 @@ TwoWire::TwoWire(uint8_t bus_num)
     :num(bus_num & 1)
     ,sda(-1)
     ,scl(-1)
+    ,i2c(NULL)
     ,rxIndex(0)
     ,rxLength(0)
+    ,rxQueued(0)
+    ,txIndex(0)
     ,txLength(0)
     ,txAddress(0)
+    ,txQueued(0)
+    ,transmitting(0)
+    ,last_error(I2C_ERROR_OK)
     ,_timeOutMillis(50)
-    ,nonStop(false)
-#if !CONFIG_DISABLE_HAL_LOCKS
-    ,nonStopTask(NULL)
-    ,lock(NULL)
-#endif
 {}
 
 TwoWire::~TwoWire()
 {
-    end();
-#if !CONFIG_DISABLE_HAL_LOCKS
-    if(lock != NULL){
-        vSemaphoreDelete(lock);
+    flush();
+    if(i2c) {
+        i2cRelease(i2c);
+        i2c=NULL;
     }
-#endif
-}
-
-bool TwoWire::setPins(int sdaPin, int sclPin)
-{
-#if !CONFIG_DISABLE_HAL_LOCKS
-    if(lock == NULL){
-        lock = xSemaphoreCreateMutex();
-        if(lock == NULL){
-            log_e("xSemaphoreCreateMutex failed");
-            return false;
-        }
-    }
-    //acquire lock
-    if(xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-        log_e("could not acquire lock");
-        return false;
-    }
-#endif
-    if(!i2cIsInit(num)){
-        sda = sdaPin;
-        scl = sclPin;
-    } else {
-        log_e("bus already initialized. change pins only when not.");
-    }
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //release lock
-    xSemaphoreGive(lock);
-#endif
-    return !i2cIsInit(num);
 }
 
 bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
 {
-    bool started = false;
-    esp_err_t err = ESP_OK;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    if(lock == NULL){
-        lock = xSemaphoreCreateMutex();
-        if(lock == NULL){
-            log_e("xSemaphoreCreateMutex failed");
-            return false;
-        }
-    }
-    //acquire lock
-    if(xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-        log_e("could not acquire lock");
-        return false;
-    }
-#endif
-    if(i2cIsInit(num)){
-        started = true;
-        goto end;
-    }
     if(sdaPin < 0) { // default param passed
         if(num == 0) {
             if(sda==-1) {
@@ -120,7 +70,7 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
         } else {
             if(sda==-1) {
                 log_e("no Default SDA Pin for Second Peripheral");
-                goto end; //no Default pin for Second Peripheral
+                return false; //no Default pin for Second Peripheral
             } else {
                 sdaPin = sda;    // reuse prior pin
             }
@@ -137,7 +87,7 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
         } else {
             if(scl == -1) {
                 log_e("no Default SCL Pin for Second Peripheral");
-                goto end; //no Default pin for Second Peripheral
+                return false; //no Default pin for Second Peripheral
             } else {
                 sclPin = scl;    // reuse prior pin
             }
@@ -146,74 +96,14 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
 
     sda = sdaPin;
     scl = sclPin;
-    err = i2cInit(num, sda, scl, frequency);
-    started = (err == ESP_OK);
-
-end:
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //release lock
-    xSemaphoreGive(lock);
-#endif
-    return started;
-
-}
-
-bool TwoWire::end()
-{
-    esp_err_t err = ESP_OK;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    if(lock != NULL){
-        //acquire lock
-        if(xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-            log_e("could not acquire lock");
-            return false;
-        }
-#endif
-        if(i2cIsInit(num)){
-            err = i2cDeinit(num);
-        }
-#if !CONFIG_DISABLE_HAL_LOCKS
-        //release lock
-        xSemaphoreGive(lock);
-    }
-#endif
-    return (err == ESP_OK);
-}
-
-uint32_t TwoWire::getClock()
-{
-    uint32_t frequency = 0;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //acquire lock
-    if(lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-        log_e("could not acquire lock");
-    } else {
-#endif
-        i2cGetClock(num, &frequency);
-#if !CONFIG_DISABLE_HAL_LOCKS
-        //release lock
-        xSemaphoreGive(lock);
-    }
-#endif
-    return frequency;
-}
-
-bool TwoWire::setClock(uint32_t frequency)
-{
-    esp_err_t err = ESP_OK;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //acquire lock
-    if(lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-        log_e("could not acquire lock");
+    i2c = i2cInit(num, sdaPin, sclPin, frequency);
+    if(!i2c) {
         return false;
     }
-#endif
-    err = i2cSetClock(num, frequency);
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //release lock
-    xSemaphoreGive(lock);
-#endif
-    return (err == ESP_OK);
+
+    flush();
+    return true;
+
 }
 
 void TwoWire::setTimeOut(uint16_t timeOutMillis)
@@ -226,92 +116,112 @@ uint16_t TwoWire::getTimeOut()
     return _timeOutMillis;
 }
 
+void TwoWire::setClock(uint32_t frequency)
+{
+    i2cSetFrequency(i2c, frequency);
+}
+
+size_t TwoWire::getClock()
+{
+    return i2cGetFrequency(i2c);
+}
+
+/* stickBreaker Nov 2017 ISR, and bigblock 64k-1
+ */
+i2c_err_t TwoWire::writeTransmission(uint16_t address, uint8_t *buff, uint16_t size, bool sendStop)
+{
+    last_error = i2cWrite(i2c, address, buff, size, sendStop, _timeOutMillis);
+    return last_error;
+}
+
+i2c_err_t TwoWire::readTransmission(uint16_t address, uint8_t *buff, uint16_t size, bool sendStop, uint32_t *readCount)
+{
+    last_error = i2cRead(i2c, address, buff, size, sendStop, _timeOutMillis, readCount);
+    return last_error;
+}
+
 void TwoWire::beginTransmission(uint16_t address)
 {
-#if !CONFIG_DISABLE_HAL_LOCKS
-    if(nonStop && nonStopTask == xTaskGetCurrentTaskHandle()){
-        log_e("Unfinished Repeated Start transaction! Expected requestFrom, not beginTransmission! Clearing...");
-        //release lock
-        xSemaphoreGive(lock);
-    }
-    //acquire lock
-    if(lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-        log_e("could not acquire lock");
-        return;
-    }
-#endif
-    nonStop = false;
+    transmitting = 1;
     txAddress = address;
-    txLength = 0;
+    txIndex = txQueued; // allow multiple beginTransmission(),write(),endTransmission(false) until endTransmission(true)
+    txLength = txQueued;
+    last_error = I2C_ERROR_OK;
 }
 
-uint8_t TwoWire::endTransmission(bool sendStop)
+/*stickbreaker isr
+ */
+uint8_t TwoWire::endTransmission(bool sendStop)  // Assumes Wire.beginTransaction(), Wire.write()
 {
-    esp_err_t err = ESP_OK;
-    if(sendStop){
-        err = i2cWrite(num, txAddress, txBuffer, txLength, _timeOutMillis);
-#if !CONFIG_DISABLE_HAL_LOCKS
-        //release lock
-        xSemaphoreGive(lock);
-#endif
+    if(transmitting == 1) {
+            // txlength is howmany bytes in txbuffer have been use
+        last_error = writeTransmission(txAddress, &txBuffer[txQueued], txLength - txQueued, sendStop);
+        if(last_error == I2C_ERROR_CONTINUE){
+            txQueued = txLength;
+        } else if( last_error == I2C_ERROR_OK){
+          rxIndex = 0;
+          rxLength = rxQueued;
+          rxQueued = 0;
+          txQueued = 0; // the SendStop=true will restart all Queueing
+        }
     } else {
-        //mark as non-stop
-        nonStop = true;
-#if !CONFIG_DISABLE_HAL_LOCKS
-        nonStopTask = xTaskGetCurrentTaskHandle();
-#endif
+        last_error = I2C_ERROR_NO_BEGIN;
+        flush();
     }
-    switch(err){
-        case ESP_OK: return 0;
-        case ESP_FAIL: return 2;
-        case ESP_ERR_TIMEOUT: return 5;
-        default: break;
-    }
-    return 4;
+    txIndex = 0;
+    txLength = 0;
+    transmitting = 0;
+    return (last_error == I2C_ERROR_CONTINUE)?I2C_ERROR_OK:last_error; // Don't return Continue for compatibility.
 }
 
+/* @stickBreaker 11/2017 fix for ReSTART timeout, ISR
+ */
 uint8_t TwoWire::requestFrom(uint16_t address, uint8_t size, bool sendStop)
 {
-    esp_err_t err = ESP_OK;
-    if(nonStop
-#if !CONFIG_DISABLE_HAL_LOCKS
-    && nonStopTask == xTaskGetCurrentTaskHandle()
-#endif
-    ){
-        if(address != txAddress){
-            log_e("Unfinished Repeated Start transaction! Expected address do not match! %u != %u", address, txAddress);
-            return 0;
-        }
-        nonStop = false;
-        rxIndex = 0;
-        rxLength = 0;
-        err = i2cWriteReadNonStop(num, address, txBuffer, txLength, rxBuffer, size, _timeOutMillis, &rxLength);
-    } else {
-#if !CONFIG_DISABLE_HAL_LOCKS
-        //acquire lock
-        if(lock == NULL || xSemaphoreTake(lock, portMAX_DELAY) != pdTRUE){
-            log_e("could not acquire lock");
-            return 0;
-        }
-#endif
-        rxIndex = 0;
-        rxLength = 0;
-        err = i2cRead(num, address, rxBuffer, size, _timeOutMillis, &rxLength);
+    //use internal Wire rxBuffer, multiple requestFrom()'s may be pending, try to share rxBuffer
+    uint32_t cnt = rxQueued; // currently queued reads, next available position in rxBuffer
+    if(cnt < (I2C_BUFFER_LENGTH-1) && (size + cnt) <= I2C_BUFFER_LENGTH) { // any room left in rxBuffer
+        rxQueued += size;
+    } else { // no room to receive more!
+        log_e("rxBuff overflow %d", cnt + size);
+        cnt = 0;
+        last_error = I2C_ERROR_MEMORY;
+        flush();
+        return cnt;
     }
-#if !CONFIG_DISABLE_HAL_LOCKS
-    //release lock
-    xSemaphoreGive(lock);
-#endif
-    return rxLength;
+
+    last_error = readTransmission(address, &rxBuffer[cnt], size, sendStop, &cnt);
+    rxIndex = 0;
+  
+    rxLength = cnt;
+  
+    if( last_error != I2C_ERROR_CONTINUE){ // not a  buffered ReSTART operation
+      // so this operation actually moved data, queuing is done.
+        rxQueued = 0;
+        txQueued = 0; // the SendStop=true will restart all Queueing or error condition
+    }
+  
+    if(last_error != I2C_ERROR_OK){ // ReSTART on read does not return any data
+        cnt = 0;
+    }
+  
+    return cnt;
 }
 
 size_t TwoWire::write(uint8_t data)
 {
-    if(txLength >= I2C_BUFFER_LENGTH) {
-        return 0;
+    if(transmitting) {
+        if(txLength >= I2C_BUFFER_LENGTH) {
+            last_error = I2C_ERROR_MEMORY;
+            return 0;
+        }
+        txBuffer[txIndex] = data;
+        ++txIndex;
+        txLength = txIndex;
+        return 1;
     }
-    txBuffer[txLength++] = data;
-    return 1;
+    last_error = I2C_ERROR_NO_BEGIN; // no begin, not transmitting
+    return 0;
 }
 
 size_t TwoWire::write(const uint8_t *data, size_t quantity)
@@ -335,7 +245,8 @@ int TwoWire::read(void)
 {
     int value = -1;
     if(rxIndex < rxLength) {
-        value = rxBuffer[rxIndex++];
+        value = rxBuffer[rxIndex];
+        ++rxIndex;
     }
     return value;
 }
@@ -353,8 +264,11 @@ void TwoWire::flush(void)
 {
     rxIndex = 0;
     rxLength = 0;
+    txIndex = 0;
     txLength = 0;
-    //i2cFlush(num); // cleanup
+    rxQueued = 0;
+    txQueued = 0;
+    i2cFlush(i2c); // cleanup
 }
 
 uint8_t TwoWire::requestFrom(uint8_t address, uint8_t quantity, uint8_t sendStop)
@@ -400,6 +314,57 @@ void TwoWire::beginTransmission(uint8_t address)
 uint8_t TwoWire::endTransmission(void)
 {
     return endTransmission(true);
+}
+
+/* stickbreaker Nov2017 better error reporting
+ */
+uint8_t TwoWire::lastError()
+{
+    return (uint8_t)last_error;
+}
+
+const char ERRORTEXT[] =
+    "OK\0"
+    "DEVICE\0"
+    "ACK\0"
+    "TIMEOUT\0"
+    "BUS\0"
+    "BUSY\0"
+    "MEMORY\0"
+    "CONTINUE\0"
+    "NO_BEGIN\0"
+    "\0";
+
+
+char * TwoWire::getErrorText(uint8_t err)
+{
+    uint8_t t = 0;
+    bool found = false;
+    char * message = (char*)&ERRORTEXT;
+
+    while(!found && message[0]) {
+        found = t == err;
+        if(!found) {
+            message = message + strlen(message) + 1;
+            t++;
+        }
+    }
+    if(!found) {
+        return NULL;
+    } else {
+        return message;
+    }
+}
+
+/*stickbreaker Dump i2c Interrupt buffer, i2c isr Debugging
+ */
+ 
+uint32_t TwoWire::setDebugFlags( uint32_t setBits, uint32_t resetBits){
+  return i2cDebug(i2c,setBits,resetBits);
+}
+
+bool TwoWire::busy(void){
+  return ((i2cGetStatus(i2c) & 16 )==16);
 }
 
 TwoWire Wire = TwoWire(0);
